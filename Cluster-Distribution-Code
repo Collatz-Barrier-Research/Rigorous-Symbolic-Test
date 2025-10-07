@@ -1,0 +1,36 @@
+def t_tree_search(initial_state, max_depth, contraction_check_interval):
+    # State: (m, d_len, P, r, depth)
+    queue = deque([initial_state + (0,)]) # Add depth to the state
+    verified_tails = set()
+    
+    while queue:
+        m, d_len, P, r, depth = queue.popleft()
+        
+        if (m, d_len, P, r) in verified_tails:
+            # Reached a previously verified terminating tail (or cycle)
+            continue 
+        
+        if depth >= max_depth:
+            # Reached a fixed maximum depth limit for the cluster search
+            continue 
+
+        # 1. Check for Contraction/Reduction (e.g., every A_k steps)
+        if depth % contraction_check_interval == 0 and depth > 0:
+            # Must verify Val(S) has contracted compared to Val(S_start)
+            # If Val(S) fails to contract, this path is potentially dangerous and needs closer inspection.
+            pass # Placeholder for complex contraction logic
+        
+        # 2. Compute Successor States T(S)
+        successor_set = compute_symbolic_transition(m, d_len, P, r, k=3) 
+        
+        # 3. Enqueue Successors
+        for m_prime, d_len_prime, P_prime, r_prime in successor_set:
+            new_state = (m_prime, d_len_prime, P_prime, r_prime)
+            new_depth = depth + 1
+            queue.append(new_state + (new_depth,))
+            
+            # Additional check: If a new state has d_len_prime < 0, 
+            # the number is now fully defined and must be checked against the Collatz $1$ cycle.
+            if d_len_prime <= 0:
+                print(f"Path terminated at depth {new_depth}. Number is fully concrete.")
+                verified_tails.add(new_state)
