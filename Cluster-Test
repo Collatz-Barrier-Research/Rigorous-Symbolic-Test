@@ -156,16 +156,14 @@ def t_tree_search(initial_states, k, avg_delta_val=-1.73, safety_margin=0.5):
     # The negative sign on delta_val means higher contraction (more negative) is higher priority.
     # path_data = (total_steps, cumulative_delta_val, starting_state)
     pq = []
+    initial_transitions_count = 0
     
     # Initialize the queue with all initial states
-    for s_init in initial_states:
-        # We start with the first transition's potential contraction as the priority
-        # We must compute T(S) immediately to determine the priority.
+    for i, s_init in enumerate(initial_states):
         
         transitions = compute_symbolic_transition(s_init[0], s_init[1], s_init[2], s_init[3], k)
         
         if not transitions:
-            # Skip states that generate no successors (should not happen for k=3 > 1)
             continue
             
         # The priority is based on the MINIMUM (worst-case) delta_val among all successors
@@ -177,12 +175,19 @@ def t_tree_search(initial_states, k, avg_delta_val=-1.73, safety_margin=0.5):
             # Priority Queue stores: (-priority_metric, state, path_data)
             # The priority is the contraction *achieved* in this step.
             heapq.heappush(pq, (-transition['delta_val'], S_prime, (1, transition['delta_val'], s_init)))
+            initial_transitions_count += 1
             
+        # Add a status update during initialization
+        if (i + 1) % 5 == 0 or (i + 1) == len(initial_states):
+            print(f"--- Initialization: Processed {i + 1}/{len(initial_states)} initial states. Queue size: {len(pq)} ---")
+
     
     # --- Search Loop ---
     
     states_processed = 0
     anomalous_paths = []
+    
+    print("\n*** Starting Priority Queue Traversal ***")
     
     while pq:
         # Get the highest priority state (highest contraction)
@@ -194,7 +199,6 @@ def t_tree_search(initial_states, k, avg_delta_val=-1.73, safety_margin=0.5):
         # Final State Check: If d_len' and m' are both 0, the number is small (transient cycle).
         if S_current[0] == 0 and S_current[1] == 0:
             states_processed += 1
-            # Path closed out by a finite transient (e.g., the 1-4-2-1 cycle)
             continue 
 
         # --- Dynamic Outlier Flagging Check (CRITICAL) ---
@@ -242,6 +246,10 @@ def t_tree_search(initial_states, k, avg_delta_val=-1.73, safety_margin=0.5):
             
             # The new priority is based on the WORST-CASE contraction in the very next step
             heapq.heappush(pq, (-min_next_delta_val, S_next, (new_total_steps, new_cumulative_delta_val, s_start)))
+            
+        # Provide status update during traversal
+        if states_processed % 100 == 0:
+            print(f"  > Traversal: Processed {states_processed} states. Queue size: {len(pq)}. Current step: {total_steps}.")
             
     return states_processed, anomalous_paths
 
