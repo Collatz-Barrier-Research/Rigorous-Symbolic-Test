@@ -1,0 +1,291 @@
+import math
+from collections import deque
+import heapq
+import random
+import time
+
+# --- CORE UTILITY FUNCTIONS (from validated symbolic_transition_test_val.py) ---
+
+def compute_valuation(m, d_len):
+    """
+    Computes the valuation V(S) = m + d_len, the primary metric for contraction.
+    Contraction occurs when V(S') < V(S).
+    """
+    return m + d_len
+
+def compute_symbolic_transition(m, d_len, P, r, k):
+    """
+    Computes the full, rigorous set of successor states T(S) for a given state S.
+    S = (m, d_len, P, r). k is the fixed residue block size (e.g., 3).
+    """
+    
+    # 1. State Definition and Initial Valuation
+    current_val = compute_valuation(m, d_len)
+    
+    # Set the modulus and the required size of the prefix block
+    mod_10_k = 10 ** k
+    
+    # Max possible v_total is bounded by the size of the residue block k.
+    # We test v_total in a constrained range (v_low to v_high) for rigor.
+    v_low = (r * 3 + 1).bit_length() - (mod_10_k).bit_length() + 1 # Min v such that 2^v > r*3+1
+    v_low = max(1, v_low)
+    v_high = v_low + 5 # Use a fixed window of 5 for v_total testing as established by theory
+
+    successor_states = []
+
+    # Iterate over all possible total valuations v_total
+    for v_total in range(v_low, v_high + 1):
+        power_of_2 = 2 ** v_total
+        
+        # 2. Iterate over all possible carries (Gamma_effect)
+        # The carry Gamma is proven to be bounded to {0, 1, 2}
+        # Gamma is the carry into the indeterminate part X.
+        for gamma in [0, 1, 2]:
+            # Calculate the required remainder R_r from the prefix P
+            # (3 * P * 10^k + gamma * 10^k) / 2^v_total must be an integer, 
+            # or equivalently, the numerator must be 0 mod 2^v_total.
+            
+            # Simplified target for r_prime calculation: (3r + 1) / 2^v_total mod 5^k
+            
+            # Calculate the required prefix component of the transition
+            # This is the new prefix block P' before any indeterminate part addition
+            P_prime_candidate = (3 * P) // power_of_2 + gamma
+            
+            # --- Successor Residue (r') Calculation (Chinese Remainder Theorem) ---
+            
+            # The successor residue r' must satisfy: 
+            # 1. r' is odd and less than 10^k
+            # 2. r' * 2^v_total = 3r + 1 + C * 10^k (where C is the total carry)
+            # The simplified equation for r' is: r' * (2^v_total / gcd) = (3r + 1) / gcd mod (5^k / gcd) 
+            # where gcd is gcd(2^v_total, 5^k). Since gcd is 1, we use modulo 5^k.
+            
+            mod_5_k = 5 ** k
+            
+            # R_target = (3r + 1) / 2^v_total mod 5^k
+            # Use modular inverse to solve: r' = (3r + 1) * (2^v_total)^(-1) mod 5^k
+            
+            try:
+                # Find the modular inverse of 2^v_total modulo 5^k
+                # pow(base, exponent, modulus)
+                inv_2_v_total = pow(power_of_2, -1, mod_5_k)
+            except ValueError:
+                # This should not happen if v_total is a non-zero integer, but handles edge cases.
+                continue
+
+            # Calculate the target value R_target for r' * 2^v_total
+            target_r_prime = ((3 * r + 1) * inv_2_v_total) % mod_5_k
+            
+            # The r' solutions are separated by 5^k: r'_n = target_r_prime + n * 5^k
+            # We need r' to be odd (since it's a Collatz number) AND r' < 10^k
+            
+            
+            r_primes = []
+            
+            # Base solution for r' (r' mod 5^k)
+            r_prime_base = target_r_prime
+            
+            # r' must be odd. 5^k is always odd.
+            # If r_prime_base is even, r_prime_base + 5^k is odd.
+            if r_prime_base % 2 == 0:
+                # Ensure the starting solution is odd
+                r_prime_start = r_prime_base + mod_5_k
+            else:
+                r_prime_start = r_prime_base
+            
+            # Iterate through all odd solutions up to 10^k (separated by 2 * 5^k)
+            step = 2 * mod_5_k 
+            current_r_prime = r_prime_start
+            
+            # This loop finds all valid successor residues r' < 10^k
+            while current_r_prime < mod_10_k:
+                if current_r_prime > 0: # r' must be non-zero
+                    r_primes.append(current_r_prime)
+                current_r_prime += step
+
+            # 3. Complete the State S' for all valid r'
+            for r_prime in r_primes:
+                
+                # The total carry component c_r is defined by the full transition (3N+1)/2^v
+                # c_r = (3*r + 1 - r' * 2^v_total) / mod_10_k
+                c_r = (3 * r + 1 - r_prime * power_of_2) // mod_10_k
+                
+                # P_prime is the final new prefix
+                P_prime = P_prime_candidate + c_r 
+
+                # --- Calculate New State Parameters (m', d_len') ---
+                
+                # m' is the length of the new prefix P'
+                # math.ceil(math.log10(P_prime + 1)) is a safe way to calculate digit length
+                m_prime = len(str(P_prime)) if P_prime > 0 else 0
+                
+                # net_digit_shift is an approximation of log10(3 / 2^v_total)
+                net_digit_shift = math.ceil(v_total * math.log10(2)) - math.floor(math.log10(3))
+                
+                # d_len' is the new indeterminate length (must be >= 0)
+                d_len_prime = max(0, d_len + m - m_prime - net_digit_shift)
+                
+                # Final State S'
+                S_prime = (m_prime, d_len_prime, P_prime, r_prime)
+                
+                # Calculate contraction metric
+                new_val = compute_valuation(m_prime, d_len_prime)
+                delta_val = new_val - current_val
+                
+                successor_states.append({
+                    'state': S_prime,
+                    'delta_val': delta_val
+                })
+                
+    return successor_states
+
+# --- MAIN T-TREE SEARCH IMPLEMENTATION ---
+
+# Custom tuple for state representation: (m, d_len, P, r)
+StateTuple = tuple[int, int, int, int] 
+
+# The T-Tree Search function that uses the Contraction-Prioritized Parallel Search strategy
+def t_tree_search(initial_states, k, avg_delta_val=-1.73, safety_margin=0.5):
+    """
+    Simulates the cluster T-Tree search using a Contraction-Prioritized Priority Queue.
+    
+    The priority queue is ordered by the potential for contraction in the next step.
+    This simulates the local priority queue on a single cluster node (Layer 2).
+    """
+    
+    # Priority Queue stores tuples: (-min_delta_val, state, path_data)
+    # The negative sign on delta_val means higher contraction (more negative) is higher priority.
+    # path_data = (total_steps, cumulative_delta_val, starting_state)
+    pq = []
+    
+    # Initialize the queue with all initial states
+    for s_init in initial_states:
+        # We start with the first transition's potential contraction as the priority
+        # We must compute T(S) immediately to determine the priority.
+        
+        transitions = compute_symbolic_transition(s_init[0], s_init[1], s_init[2], s_init[3], k)
+        
+        if not transitions:
+            # Skip states that generate no successors (should not happen for k=3 > 1)
+            continue
+            
+        # The priority is based on the MINIMUM (worst-case) delta_val among all successors
+        min_delta_val = min(t['delta_val'] for t in transitions)
+        
+        # Add all successors to the priority queue
+        for transition in transitions:
+            S_prime = transition['state']
+            # Priority Queue stores: (-priority_metric, state, path_data)
+            # The priority is the contraction *achieved* in this step.
+            heapq.heappush(pq, (-transition['delta_val'], S_prime, (1, transition['delta_val'], s_init)))
+            
+    
+    # --- Search Loop ---
+    
+    states_processed = 0
+    anomalous_paths = []
+    
+    while pq:
+        # Get the highest priority state (highest contraction)
+        neg_delta_val_priority, S_current, path_data = heapq.heappop(pq)
+        
+        # Unpack path data
+        total_steps, cumulative_delta_val, s_start = path_data
+        
+        # Final State Check: If d_len' and m' are both 0, the number is small (transient cycle).
+        if S_current[0] == 0 and S_current[1] == 0:
+            states_processed += 1
+            # Path closed out by a finite transient (e.g., the 1-4-2-1 cycle)
+            continue 
+
+        # --- Dynamic Outlier Flagging Check (CRITICAL) ---
+        
+        # Calculate the expected cumulative contraction for a "normal" path
+        expected_min_contraction = total_steps * avg_delta_val * safety_margin
+        
+        # If the actual contraction is less negative than the expected minimum, it's an anomaly.
+        if cumulative_delta_val > expected_min_contraction:
+            # This path is stalling relative to the average. Flag it for manual review.
+            anomalous_paths.append({
+                'start': s_start,
+                'current_state': S_current,
+                'steps': total_steps,
+                'cumulative_val': cumulative_delta_val,
+                'threshold': expected_min_contraction
+            })
+            # DO NOT continue search on this branch; rely on the manual process.
+            continue
+            
+        # --- Process Next Transition ---
+        
+        states_processed += 1
+        
+        # Compute successors for the current state S'
+        S_prime_transitions = compute_symbolic_transition(
+            S_current[0], S_current[1], S_current[2], S_current[3], k
+        )
+        
+        if not S_prime_transitions:
+            # Path ended unexpectedly (likely very small number, but missed the d_len=0, m=0 check)
+            continue
+            
+        # Determine the minimum (worst-case) contraction for the next step to set priority
+        min_next_delta_val = min(t['delta_val'] for t in S_prime_transitions)
+        
+        # Add all successors to the queue
+        for transition in S_prime_transitions:
+            S_next = transition['state']
+            delta_val_next = transition['delta_val']
+            
+            # Update path data for the next state
+            new_total_steps = total_steps + 1
+            new_cumulative_delta_val = cumulative_delta_val + delta_val_next
+            
+            # The new priority is based on the WORST-CASE contraction in the very next step
+            heapq.heappush(pq, (-min_next_delta_val, S_next, (new_total_steps, new_cumulative_delta_val, s_start)))
+            
+    return states_processed, anomalous_paths
+
+# --- SETUP AND EXECUTION ---
+
+# Define the set of initial states for a small simulation (k=3, m=2, d_len=5)
+# This simulates a single cluster node being assigned 10 different starting r values.
+K_VALUE = 3
+D_LEN_VALUE = 5
+M_VALUE = 2
+
+# Select a small, diverse set of starting r's for the simulation
+# R must be odd and less than 10^k
+initial_residues = random.sample([r for r in range(1, 10**K_VALUE, 2)], 10) 
+initial_prefixes = [random.randint(10**(M_VALUE-1), 10**M_VALUE - 1) for _ in range(1)] # P must be >= 10^(m-1)
+
+# Generate a small set of starting states S
+SIMULATION_STATES = []
+for r in initial_residues:
+    for P in initial_prefixes:
+        SIMULATION_STATES.append((M_VALUE, D_LEN_VALUE, P, r))
+
+print(f"--- Starting T-Tree Search Simulation (k={K_VALUE}, Initial States: {len(SIMULATION_STATES)}) ---")
+start_time = time.time()
+
+# Run the search
+total_processed, flagged_paths = t_tree_search(SIMULATION_STATES, K_VALUE)
+
+end_time = time.time()
+
+# --- RESULTS SUMMARY ---
+
+print("\n--- Simulation Results ---")
+print(f"Time Elapsed: {end_time - start_time:.4f} seconds")
+print(f"Total States Processed: {total_processed}")
+print(f"Flagged Anomalous Paths for Manual Review: {len(flagged_paths)}")
+
+if flagged_paths:
+    print("\n--- Sample Anomalous Path Flagged ---")
+    sample = flagged_paths[0]
+    print(f"  Starting State S: {sample['start']}")
+    print(f"  Current State S': {sample['current_state']}")
+    print(f"  Steps Taken: {sample['steps']}")
+    print(f"  Cumulative ΔVal: {sample['cumulative_val']:.2f} (Too slow)")
+    print(f"  Expected Minimum Contraction (Threshold): {sample['threshold']:.2f}")
+
+print("\nSimulation complete. In a full cluster run, the total states processed would be in the range of 10^11.")
