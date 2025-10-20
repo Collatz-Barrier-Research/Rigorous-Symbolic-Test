@@ -27,7 +27,7 @@ except Exception as e:
 
 print(f"Worker initialized for Table: {DYNAMO_TABLE_NAME} in Region: {REGION_NAME}")
 
-# --- Helper Functions for Node Management ---
+# --- Helper Functions for Node Management (Finalized ID and Depth Logic) ---
 
 def calculate_hash(data):
     """
@@ -35,35 +35,44 @@ def calculate_hash(data):
     This hash should ONLY be based on the immutable, algebraic properties of the node.
     """
     # Ensure consistent order by sorting keys before dumping to JSON
-    # In a real T-Tree, 'data' would include residue, inclusion vector, etc.
     dumped_data = json.dumps(data, sort_keys=True)
     return hashlib.sha256(dumped_data.encode('utf-8')).hexdigest()
 
 def generate_node_id(parent_node_id):
     """
-    Generates a unique Node ID that is used as the DynamoDB Partition Key.
+    Generates a unique Node ID. Uses '|' to reliably separate the parent ID from
+    the new unique suffix, allowing for accurate depth calculation.
     """
     # Use nanoseconds + random for maximum collision avoidance
     timestamp_ns = time.time_ns()
     rand_suffix = random.randint(1000, 9999) 
     
     if parent_node_id is None:
-        # This branch is generally not used since the root ID is pre-calculated (R_0001)
-        return f"R_ROOT_{timestamp_ns}_{rand_suffix}" 
+        # Should only be used if root ID fails, but kept for robustness.
+        return f"R_ROOT|{timestamp_ns}_{rand_suffix}" 
     
-    # Children IDs are based on the parent
-    # We strip timestamps/random suffixes from the parent ID for a cleaner ID string
-    # The actual depth check is done with a separate function (get_node_depth)
-    return f"{parent_node_id.split('_')[0]}_{timestamp_ns}_{rand_suffix}"
+    # CRITICAL: Use '|' to denote a level change.
+    # We append the new unique suffix to the parent ID.
+    return f"{parent_node_id}|{timestamp_ns}_{rand_suffix}"
 
 def get_node_depth(node_id: str) -> int:
     """
-    SIMULATION: Returns the depth of the node based on the number of non-timestamp components
-    in its ID. For 'R_0001', depth is 1. For 'R_0001_12345_6789', depth is 2.
+    Robustly calculates the depth of the node based on the number of split markers.
+    
+    Depth 1: R_0001 (Root)
+    Depth 2: R_0001|timestamp_rand
+    Depth 3: R_0001|timestamp_rand|timestamp_rand
     """
-    # For R_0001 or R_0001_12345_6789, we split by '_' and count the number of residue components
-    # This is a simulation and should be replaced with the actual depth logic in a real T-Tree.
-    return len(node_id.split('_')) - 1
+    # If the ID uses the OLD format (only '_'), we treat it as an expanded child 
+    # and conservatively set its depth to MAX_DEPTH to stop expansion.
+    if '|' not in node_id and node_id.count('_') > 1:
+        # This catches old, deep nodes like R_1_17609... and effectively prunes them.
+        return 999 
+
+    # For the correct format (and the simple R_0001 root):
+    # Count the number of split markers ('|') and add 1 for the root level.
+    # The root node 'R_0001' has 0 pipes, so 0 + 1 = Depth 1.
+    return node_id.count('|') + 1
 
 def write_node(node_id, parent_id, content):
     """Writes or updates a node in DynamoDB. Assumes NodeId is the Partition Key."""
@@ -74,7 +83,7 @@ def write_node(node_id, parent_id, content):
         'NodeId': node_id, 
         'ParentId': parent_id if parent_id else 'ROOT',
         'Content': content,
-        'Depth': get_node_depth(node_id), # Store Depth for easy query/tracking
+        'Depth': get_node_depth(node_id), # Now uses the fixed depth calculation
         'CreationTimestamp': datetime.now(timezone.utc).isoformat()
     }
     
@@ -89,18 +98,18 @@ def write_node(node_id, parent_id, content):
             Item=node_data,
             ConditionExpression='attribute_not_exists(NodeId)'
         )
-        print(f"Successfully wrote node: {node_id} (Depth: {node_data['Depth']}) with Content Hash: {node_hash}")
+        print(f"Successfully wrote node: {node_id[:20]}... (Depth: {node_data['Depth']}) with Content Hash: {node_hash[:10]}...")
         return node_hash
     except ClientError as e:
         error_code = e.response['Error']['Code']
         if error_code == 'ConditionalCheckFailedException':
-            print(f"Conditional write failed for {node_id}. Node already exists.")
+            print(f"Conditional write failed for {node_id[:20]}.... Node already exists.")
             return node_hash 
         
-        print(f"Error writing node {node_id}: {error_code} - {e.response['Error']['Message']}")
+        print(f"Error writing node {node_id[:20]}...: {error_code} - {e.response['Error']['Message']}")
         return None
     except Exception as e:
-        print(f"Error writing node {node_id}: {e}")
+        print(f"Error writing node {node_id[:20]}...: {e}")
         return None
 
 def send_sqs_job(node_id, parent_id, data):
@@ -116,17 +125,18 @@ def send_sqs_job(node_id, parent_id, data):
             QueueUrl=SQS_QUEUE_URL,
             MessageBody=json.dumps(message_body)
         )
-        print(f"Queued job for node: {node_id}")
+        # Only print the start of the ID for cleaner logs
         return True
     except ClientError as e:
-        print(f"Error queuing job for {node_id}: {e.response['Error']['Message']}")
+        print(f"Error queuing job for {node_id[:20]}...: {e.response['Error']['Message']}")
         return False
 
 # --- Core Logic ---
 
 def process_job(message):
     """Processes a single job message received from SQS."""
-    MAX_DEPTH = 15 # Set a hard limit for the tree depth simulation
+    # Set MAX_DEPTH low to ensure quick termination during testing/cleanup.
+    MAX_DEPTH = 10 
     
     try:
         job = json.loads(message['Body'])
@@ -138,18 +148,18 @@ def process_job(message):
             print("Job message is missing required fields. Deleting message.")
             return True 
 
-        print(f"Processing node {node_id}. Parent: {parent_id}.")
+        # Print only the start of the ID for cleaner logs
+        print(f"Processing node starting with: {node_id[:20]}... Parent starting with: {parent_id[:20]}...")
 
         # 1. Write the new or updated node (this will calculate and store the depth)
         new_hash = write_node(node_id, parent_id, data)
-        current_depth = get_node_depth(node_id) # Re-calculate depth
+        current_depth = get_node_depth(node_id)
         
         if new_hash:
             # --- T-Tree Stop Condition ---
-            # In a real T-Tree, this check would be based on the residue/bounding box overlap.
-            # Here, we use a simple depth check for simulation.
             if current_depth >= MAX_DEPTH:
-                print(f"Node {node_id} (Depth {current_depth}) reached MAX_DEPTH ({MAX_DEPTH}). Stopping expansion.")
+                # Log the short ID for confirmation
+                print(f"Node {node_id[:20]}... (Depth {current_depth}) reached MAX_DEPTH ({MAX_DEPTH}). Stopping expansion.")
                 return True # Successfully processed, but no new children queued.
             
             # 2. Simulate node split/expansion: create and queue two new child jobs
@@ -157,11 +167,11 @@ def process_job(message):
             child2_id = generate_node_id(node_id)
             
             # Queue child 1
-            send_sqs_job(child1_id, node_id, f"Split Data A from {node_id}")
+            send_sqs_job(child1_id, node_id, f"Split Data A from {node_id[:10]}...")
             # Queue child 2
-            send_sqs_job(child2_id, node_id, f"Split Data B from {node_id}")
+            send_sqs_job(child2_id, node_id, f"Split Data B from {node_id[:10]}...")
 
-            print(f"Job for {node_id} complete. Children jobs queued: {child1_id}, {child2_id}")
+            print(f"Job for {node_id[:20]}... complete. Children jobs queued.")
             return True # Successful processing
             
         return False # Failed to write node
@@ -178,7 +188,8 @@ def process_initial_residue(residue_id):
     Handles the special case of the first node ('R_0001') which starts the tree.
     """
     initial_content = f"Initial T-Tree Root Node for Residue {residue_id}. Structure: K_10"
-    root_id = f"R_{residue_id:04d}"
+    # The first root node uses '_' for consistency with initial setup
+    root_id = f"R_{residue_id:04d}" 
     
     print(f"Starting job for initial residue ID: {residue_id}")
     
@@ -238,11 +249,11 @@ def poll_sqs_for_jobs():
 
             for message in messages:
                 if process_job(message):
+                    # Delete message only on successful processing
                     sqs.delete_message(
                         QueueUrl=SQS_QUEUE_URL,
                         ReceiptHandle=message['ReceiptHandle']
                     )
-                    print(f"Deleted message with handle: {message['ReceiptHandle']}")
                 else:
                     print(f"Failed to process message {message.get('MessageId', 'unknown')}. It will be retried.")
 
